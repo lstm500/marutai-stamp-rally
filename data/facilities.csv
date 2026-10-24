@@ -1,0 +1,4 @@
+id,name,category,ward,address,latitude,longitude,has_open_air_bath,has_natural_hot_spring,website_url,active
+60bb2cef-09ba-5cd8-9f1b-88c12995ea55,施設データ例（品川区）,sento,品川区,東京都品川区,35.6090,139.7302,true,false,,true
+e6942fee-7c92-55cf-9210-388fa5dc05bf,施設データ例（大田区）,sento,大田区,東京都大田区,35.5614,139.7161,true,true,,true
+860fe125-2714-5fad-8bed-e762447f09f3,施設データ例（墨田区）,spa,墨田区,東京都墨田区,35.7107,139.8015,false,false,,true
