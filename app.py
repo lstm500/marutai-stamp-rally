@@ -5,6 +5,7 @@ import hmac
 import logging
 import math
 import os
+import time
 from collections import Counter
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -26,6 +27,7 @@ ASSET_DIR = ROOT / "assets"
 STAMP_PATH = ASSET_DIR / "tai_stamp.png"
 BUCKET = "visit-photos"
 LOGGER = logging.getLogger("marutai")
+APP_VERSION = "2026-10-25-visit-log-fix"
 
 # 公開一覧の取得済みデータ。出典・取得日・設備不明の扱いは検索設定欄に表示。
 # 2026-10-25に検索取得し、既存facilities形式へ変換した初期データ。
@@ -611,6 +613,7 @@ def db():
 
 def fetch_all(table: str, columns: str = "*", *, active_only=False, order="id") -> list[dict[str, Any]]:
     rows, offset = [], 0
+    fetch_started = time.perf_counter()
     # APIの既定件数で切れないよう、全ページを取得する。
     while True:
         query = db().table(table).select(columns).order(order)
@@ -618,6 +621,7 @@ def fetch_all(table: str, columns: str = "*", *, active_only=False, order="id") 
             query = query.eq("active", True)
         batch = query.range(offset, offset + 499).execute().data or []
         if not batch:
+            audit("data_read", stage=table, count=len(rows), elapsed_ms=(time.perf_counter()-fetch_started)*1000)
             return rows
         rows.extend(batch)
         offset += len(batch)
@@ -689,6 +693,215 @@ def create_visit(facility_id: str, visited_date: str, original_bytes: bytes, sta
             raise
     st.session_state["run_data"] = {}
     return row
+
+
+# ── 操作・描画・エラーの診断ログ（写真・合言葉・感想本文は記録しない） ──
+def audit(event, *, status="ok", elapsed_ms=None, **details):
+    import time
+    sid = st.session_state.setdefault("audit_session", str(uuid4()))
+    records = st.session_state.setdefault("activity_log", [])
+    allowed = {"facility_id", "visit_id", "from_view", "to_view", "action", "event_id",
+               "error_type", "error_code", "error_message", "error_stack", "stage", "count", "changed", "request_id", "source"}
+    sequence = st.session_state.get("audit_sequence", 0) + 1
+    st.session_state["audit_sequence"] = sequence
+    row = {"version": APP_VERSION, "sequence": sequence, "request_id": st.session_state.get("pending_ui_trace", {}).get("id"), "at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(), "session_id": sid,
+           "event": event, "status": status, "view": st.query_params.get("view", "home")}
+    if elapsed_ms is not None:
+        row["elapsed_ms"] = round(float(elapsed_ms), 2)
+    row.update({k: v for k, v in details.items() if k in allowed})
+    records.append(row)
+    st.session_state["audit_dirty"] = True
+    LOGGER.info("UI %s", _json.dumps(row, ensure_ascii=False))
+
+
+def audit_error(event, exc, **details):
+    import re
+    import traceback
+    message = str(exc)
+    for name in ("SUPABASE_SERVICE_ROLE_KEY", "APP_PASSWORD"):
+        secret = setting(name)
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    for note in st.session_state.get("visit_notes", {}).values():
+        if isinstance(note, str) and len(note) >= 3:
+            message = message.replace(note, "[NOTE]")
+    message = re.sub(r"https?://[^\s'\"<>]+", "[URL]", message)
+    stack = [{"file": Path(t.filename).name, "line": t.lineno, "function": t.name}
+             for t in traceback.extract_tb(exc.__traceback__)[-8:]]
+    audit(event, status="error", error_type=type(exc).__name__, error_code=getattr(exc, "code", None),
+          error_message=message[:1500], error_stack=stack, **details)
+
+
+def begin_ui_action(action, *, facility_id=None, event_id=None, click_ms=None):
+    import time
+    trace = {"id": event_id or str(uuid4()), "action": action, "facility_id": facility_id,
+             "click_ms": click_ms, "started": time.perf_counter()}
+    st.session_state["pending_ui_trace"] = trace
+    audit("action_received", action=action, facility_id=facility_id, event_id=trace["id"])
+    return trace
+
+
+def flush_activity_logs():
+    if not st.session_state.get("audit_dirty"):
+        return
+    rows = st.session_state.get("activity_log", [])
+    if not rows:
+        return
+    sid = st.session_state["audit_session"]
+    day = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
+    part = st.session_state.get("audit_part", 0)
+    path = f"activity-logs/{day}/{sid}-{part:04d}.jsonl"
+    body = "\n".join(_json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
+    try:
+        db().storage.from_(BUCKET).upload(path, body.encode(),
+            file_options={"content-type": "application/x-ndjson", "upsert": "true"})
+        st.session_state["audit_dirty"] = False
+        st.session_state.pop("audit_storage_error", None)
+        if len(rows) >= 500:
+            st.session_state["activity_log"] = []
+            st.session_state["audit_part"] = part + 1
+    except Exception as exc:
+        st.session_state["audit_storage_error"] = type(exc).__name__
+        audit_error("log_persist_failed", exc, stage="storage_upload")
+        LOGGER.exception("動作ログの永続保存失敗")
+        # 通信復旧後の再送用に残す。上限を超えると端末内DL用の別バッファに退避。
+        if len(rows) > 2000:
+            st.session_state["audit_overflow"] = st.session_state.get("audit_overflow", []) + rows[:1000]
+            del rows[:1000]
+
+
+@st.cache_resource(show_spinner=False)
+def paint_report_component():
+    return st.components.v2.component("marutai_display_report", html='<span style="display:none"></span>',
+        js="""
+        export default function({parentElement,data,setStateValue}) {
+          if (!data || parentElement.dataset.reported === data.id) return;
+          parentElement.dataset.reported = data.id;
+          let alive = true;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (alive) setStateValue('paint', {id:data.id, screen:data.screen,
+                elapsed_ms: data.click_ms ? Math.max(0,Date.now()-data.click_ms) : null});
+          }));
+          return () => { alive=false; };
+        }
+        """)
+
+
+def report_display_timing(screen):
+    trace = st.session_state.get("pending_ui_trace")
+    if not trace or st.session_state.get("last_painted_action") == trace["id"]:
+        return
+    result = paint_report_component()(key="ui_display_report", data={"id": trace["id"],
+        "click_ms": trace.get("click_ms"), "screen": screen}, default={"paint": None},
+        on_paint_change=lambda: None)
+    report = result.paint
+    if isinstance(report, dict) and report.get("id") == trace["id"]:
+        elapsed = report.get("elapsed_ms")
+        if isinstance(elapsed, (int, float)) and 0 <= elapsed <= 3600000:
+            audit("browser_first_paint", elapsed_ms=elapsed, action=trace["action"],
+                  facility_id=trace.get("facility_id"), event_id=trace["id"], to_view=report.get("screen"))
+        else:
+            audit("browser_display_confirmed", action=trace["action"], event_id=trace["id"], to_view=report.get("screen"), stage="server_to_browser_ack", elapsed_ms=(time.perf_counter()-trace["started"])*1000)
+        st.session_state["last_painted_action"] = trace["id"]
+
+
+def render_activity_logs():
+    with st.expander("動作ログ・エラーの確認"):
+        st.caption("操作、サーバー処理時間、表示画面、ブラウザの初回描画時間、エラー種別を記録します。写真や感想本文は含めません。")
+        rows = st.session_state.get("audit_overflow", []) + st.session_state.get("activity_log", [])
+        if st.session_state.get("audit_storage_error"):
+            st.warning("ログのクラウド保存に失敗しています。このセッションのログは下からダウンロードできます。")
+        st.download_button("このセッションのログをダウンロード", "\n".join(_json.dumps(r, ensure_ascii=False) for r in rows),
+                           file_name="marutai_activity.jsonl", mime="application/x-ndjson", key="download_activity")
+        day = st.date_input("保存済みログの日付", value=datetime.now(ZoneInfo("Asia/Tokyo")).date(), key="log_day")
+        if st.button("この日の保存済みログを取得", key="fetch_activity"):
+            try:
+                bucket = db().storage.from_(BUCKET)
+                prefix = "activity-logs/" + day.isoformat()
+                parts, offset = [], 0
+                while True:
+                    files = bucket.list(prefix, {"limit": 100, "offset": offset, "sortBy": {"column": "name", "order": "asc"}})
+                    if not files:
+                        break
+                    for f in files:
+                        if str(f.get("name", "")).endswith(".jsonl"):
+                            parts.append(bucket.download(prefix + "/" + f["name"]).decode("utf-8"))
+                    offset += len(files)
+                st.session_state["download_saved_activity"] = "\n".join(parts)
+                st.session_state["download_saved_activity_day"] = day.isoformat()
+                st.info(f"{len(parts)}ファイルのログを取得しました。")
+            except Exception as exc:
+                audit_error("log_download_failed", exc)
+                st.error("保存済みログを取得できませんでした。")
+        if st.session_state.get("download_saved_activity"):
+            st.download_button("取得したログをダウンロード", st.session_state["download_saved_activity"],
+                               file_name="marutai_activity_" + st.session_state["download_saved_activity_day"] + ".jsonl",
+                               mime="application/x-ndjson", key="download_saved_activity_button")
+
+
+# ── 「行ってきた！」は写真不要の訪問済み記録。内容は後から追記できる ──
+def mark_facility_visited(facility_id):
+    import time
+    started = time.perf_counter()
+    existing = visits_for_facility(facility_id)
+    if existing:
+        audit("visit_already_recorded", facility_id=facility_id, visit_id=existing[0]["id"])
+        return existing[0]
+    row = dict(id=str(uuid5(NAMESPACE_URL, "marutai-visited:" + facility_id)), facility_id=facility_id,
+               visited_date=datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat(),
+               original_photo_url="", stamped_photo_url="")
+    db().table("visits").upsert(row, on_conflict="id").execute()
+    st.session_state["run_data"] = {}
+    # 書き込めたことを再取得で確かめてから、訪問済みとして描画する。
+    confirmed = visits_for_facility(facility_id)
+    if not any(v["id"] == row["id"] for v in confirmed):
+        raise RuntimeError("訪問済み記録の保存確認に失敗しました。")
+    audit("visit_marked", facility_id=facility_id, visit_id=row["id"], elapsed_ms=(time.perf_counter()-started)*1000)
+    return row
+
+
+def read_visit_note(visit_id):
+    cache = st.session_state.setdefault("visit_notes", {})
+    if visit_id not in cache:
+        try:
+            body = db().storage.from_(BUCKET).download(f"visit-details/{visit_id}.json")
+            cache[visit_id] = _json.loads(body.decode("utf-8")).get("note", "")
+        except Exception as exc:
+            # 新規の訪問にはまだ内容ファイルがない。404以外の障害は記録する。
+            code = getattr(exc, "status", getattr(exc, "status_code", None))
+            if str(code) != "404" and "not found" not in str(exc).lower() and "not_found" not in str(exc).lower():
+                audit("visit_note_read", status="error", visit_id=visit_id, error_type=type(exc).__name__)
+                return None
+            cache[visit_id] = ""
+    return cache[visit_id]
+
+
+def save_visited_content(visit, visited_date, note, photo=None):
+    import time
+    started = time.perf_counter()
+    vid, fid = str(visit["id"]), str(visit["facility_id"])
+    bucket = db().storage.from_(BUCKET)
+    fields = {"visited_date": visited_date.isoformat()}
+    if photo:
+        original = _normalize_photo(photo)
+        stamped = add_visit_stamp(original, visited_date.isoformat())
+        suffix = str(uuid4())
+        fields["original_photo_url"] = f"original/{fid}/{vid}-{suffix}.jpg"
+        fields["stamped_photo_url"] = f"stamped/{fid}/{vid}-{suffix}.jpg"
+        bucket.upload(fields["original_photo_url"], original, file_options={"content-type": "image/jpeg", "upsert": "false"})
+        bucket.upload(fields["stamped_photo_url"], stamped, file_options={"content-type": "image/jpeg", "upsert": "false"})
+    elif visited_date.isoformat() != str(visit["visited_date"]) and visit.get("original_photo_url"):
+        # 日付だけ変更した場合も写真上のスタンプ日付を揃える。
+        original = bucket.download(visit["original_photo_url"])
+        stamped = add_visit_stamp(original, visited_date.isoformat())
+        fields["stamped_photo_url"] = f"stamped/{fid}/{vid}-{uuid4()}.jpg"
+        bucket.upload(fields["stamped_photo_url"], stamped, file_options={"content-type": "image/jpeg", "upsert": "false"})
+    db().table("visits").update(fields).eq("id", vid).execute()
+    body = _json.dumps({"visit_id": vid, "note": note, "updated_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat()}, ensure_ascii=False).encode()
+    bucket.upload(f"visit-details/{vid}.json", body, file_options={"content-type": "application/json", "upsert": "true"})
+    st.session_state.setdefault("visit_notes", {})[vid] = note
+    st.session_state["run_data"] = {}
+    audit("visit_content_saved", visit_id=vid, facility_id=fid, elapsed_ms=(time.perf_counter()-started)*1000)
 
 
 # ── 公開施設一覧の検索・正規化（保存形式は既存facilitiesの11列） ──
@@ -1165,6 +1378,7 @@ def build_facility_map(
             </div>
             """
 
+        marker_html = marker_html.replace("<div ", '<div data-marutai-marker="' + escape(fid, quote=True) + '" ', 1)
         name = escape(str(facility.get("name", "")))
         ward = escape(str(facility.get("ward", "")))
         category = escape(CATEGORY_LABELS.get(facility.get("category"), "温浴施設"))
@@ -1174,6 +1388,8 @@ def build_facility_map(
 
         safe_fid = escape(fid, quote=True)
 
+        visit_button_label = "✓ 訪問済み" if visited else "📷 行ってきた！"
+        visit_button_disabled = "disabled" if visited else ""
         popup_html = f"""
         <div style="font-family:-apple-system,BlinkMacSystemFont,'Yu Gothic',sans-serif;color:#173a5e;min-width:190px;line-height:1.55;">
           <div style="font-size:16px;font-weight:800;margin-bottom:3px;">{name}</div>
@@ -1181,7 +1397,7 @@ def build_facility_map(
           <div style="font-size:13px;font-weight:700;color:{'#d9362b' if visited else '#173a5e'};">{visit_text}</div>
           <div style="font-size:12px;margin-top:5px;">♨ {escape(open_air)}<br>♨ {escape(natural)}</div>
           <button type="button" data-marutai-action="detail" data-facility-id="{safe_fid}" style="display:block;width:100%;min-height:42px;margin-top:8px;padding:8px 10px;border:0;border-radius:9px;background:#d9362b;color:#fff;font-weight:800;font-size:14px;cursor:pointer;">詳しく見る</button>
-          <button type="button" data-marutai-action="visit" data-facility-id="{safe_fid}" style="display:block;width:100%;min-height:42px;margin-top:7px;padding:8px 10px;border:1px solid #d9362b;border-radius:9px;background:#fff4ee;color:#173a5e;font-weight:800;font-size:14px;cursor:pointer;">📷 行ってきた！</button>
+          <button type="button" data-marutai-action="visit" data-facility-id="{safe_fid}" {visit_button_disabled} style="display:block;width:100%;min-height:42px;margin-top:7px;padding:8px 10px;border:1px solid #d9362b;border-radius:9px;background:#fff4ee;color:#173a5e;font-weight:800;font-size:14px;cursor:pointer;">{visit_button_label}</button>
         </div>
         """
         folium.Marker(
@@ -1200,16 +1416,21 @@ def facility_map_component():
         "marutai_facility_map_actions",
         html='<iframe title="施設地図" sandbox="allow-scripts allow-same-origin allow-popups" style="display:block;width:100%;border:0;border-radius:16px;"></iframe>',
         js="""
-        export default function({ parentElement, data, setTriggerValue }) {
+        export default function({ parentElement, data, setStateValue }) {
           const frame = parentElement.querySelector('iframe');
           frame.style.height = `${data.height}px`;
           const receive = event => {
             const message = event.data;
             if (event.source !== frame.contentWindow || !message ||
-                message.type !== 'marutai-map-action' || message.token !== data.token) return;
+                message.token !== data.token) return;
+            if (message.type === 'marutai-map-diagnostic') {
+              setStateValue('diagnostic', {event:message.event, event_id:message.event_id, facility_id:message.facility_id || null});
+              return;
+            }
+            if (message.type !== 'marutai-map-action') return;
             if (!['detail', 'visit'].includes(message.action) || typeof message.facility_id !== 'string') return;
-            setTriggerValue('action', {action:message.action, facility_id:message.facility_id,
-                                      event_id:message.event_id});
+            setStateValue('action', {action:message.action, facility_id:message.facility_id,
+                  event_id:message.event_id, click_ms:message.click_ms, view:message.view});
           };
           window.addEventListener('message', receive);
           if (frame.dataset.renderHash !== data.render_hash) {
@@ -1225,45 +1446,111 @@ def facility_map_component():
 def handle_facility_map_action(action, go, key):
     if not isinstance(action, dict) or action.get("action") not in ("detail", "visit"):
         return
-    fid = str(action.get("facility_id", ""))
-    event_id = action.get("event_id")
+    fid, event_id = str(action.get("facility_id", "")), action.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return
     seen = st.session_state.setdefault("map_actions_seen", {})
     if seen.get(key) == event_id:
         return
+    seen[key] = event_id
+    trace = begin_ui_action("map_" + action["action"], facility_id=fid, event_id=event_id, click_ms=action.get("click_ms"))
+    if isinstance(action.get("view"), dict):
+        view = action["view"]
+        try:
+            lat, lon, zoom = float(view["lat"]), float(view["lon"]), int(view["zoom"])
+            if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180 and 1 <= zoom <= 20:
+                st.session_state["viewport_" + key] = (lat, lon, zoom)
+        except (ValueError, TypeError, KeyError):
+            pass
     if not get_facility(fid):
+        audit("map_action_failed", status="error", facility_id=fid, stage="facility_lookup", error_type="FacilityNotFound")
         st.warning("施設情報が見つかりません。地図を開き直してください。")
         return
-    seen[key] = event_id
     if action["action"] == "detail":
+        st.session_state["forwarded_map_trace"] = trace["id"]
         go("facilities", facility_id=fid)
     else:
-        go("stampbook", action="record", facility_id=fid)
+        try:
+            mark_facility_visited(fid)
+            st.session_state["visit_mark_notice"] = "訪問済みにしました。写真・感想はスタンプ帳から入力できます。"
+            audit("map_visit_completed", facility_id=fid, to_view="map", elapsed_ms=(time.perf_counter()-trace["started"])*1000)
+            flush_activity_logs()
+            st.rerun()
+        except Exception as exc:
+            audit_error("map_visit_failed", exc, facility_id=fid)
+            st.session_state["map_action_error"] = "訪問済みにできませんでした。もう一度お試しください。動作ログに記録しました。"
+            st.session_state.setdefault("map_html_cache", {}).pop(key, None)
+            flush_activity_logs()
+            st.rerun()
 
 
 def render_interactive_facility_map(facility_map, go, *, key, height=455):
     import json
     import hashlib
     token = st.session_state.setdefault("map_token_" + key, str(uuid4()))
-    # popup内のボタンを開いた後も、documentのイベント委譲でタップを受け取る。
+    viewport = st.session_state.get("viewport_" + key)
+    if viewport:
+        facility_map.location = [viewport[0], viewport[1]]
+        facility_map.options["zoom"] = viewport[2]
+        # 訪問済みにした直後も、押した場所の縮尺を保つ。
+        for child_key, child in list(facility_map._children.items()):
+            if isinstance(child, folium.map.FitBounds):
+                del facility_map._children[child_key]
+    map_name = facility_map.get_name()
     bridge = """
+    const sendDiagnostic = (event, facility_id=null) => window.parent.postMessage({
+      type:'marutai-map-diagnostic',token:TOKEN,event,facility_id,
+      event_id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)},'*');
     document.addEventListener('click', function(event) {
       const button = event.target.closest('[data-marutai-action]');
-      if (!button) return;
-      event.preventDefault();
-      event.stopPropagation();
-      window.parent.postMessage({type:'marutai-map-action', token:TOKEN,
-        action:button.dataset.marutaiAction, facility_id:button.dataset.facilityId,
-        event_id:Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)}, '*');
+      if (!button) {
+        const marker = event.target.closest('[data-marutai-marker]');
+        if (marker) sendDiagnostic('marker_open',marker.dataset.marutaiMarker);
+        return;
+      }
+      event.preventDefault(); event.stopPropagation();
+      if (button.disabled) return;
+      const originalLabel=button.textContent;
+      button.disabled=true; button.textContent='処理中…';
+      setTimeout(() => {
+        if (button.isConnected && button.disabled) {
+          button.disabled=false; button.textContent=originalLabel;
+          sendDiagnostic('map_action_timeout',button.dataset.facilityId);
+        }
+      },15000);
+      window.parent.postMessage({type:'marutai-map-action',token:TOKEN,
+        action:button.dataset.marutaiAction,facility_id:button.dataset.facilityId,click_ms:Date.now(),
+        view:{lat:MAP.getCenter().lat,lon:MAP.getCenter().lng,zoom:MAP.getZoom()},
+        event_id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)},'*');
     }, true);
-    """.replace("TOKEN", json.dumps(token))
+    window.addEventListener('error', () => sendDiagnostic('map_javascript_error'));
+    window.addEventListener('load', () => sendDiagnostic('map_frame_loaded'));
+    """.replace("TOKEN", json.dumps(token)).replace("MAP", map_name)
     facility_map.get_root().script.add_child(folium.Element(bridge))
     html = facility_map.get_root().render()
+    import re
+    signature = hashlib.sha256(re.sub(r"_[0-9a-f]{32}", "_OBJECT", html).encode()).hexdigest()
+    cache = st.session_state.setdefault("map_html_cache", {})
+    if key not in cache or cache[key]["signature"] != signature:
+        cache[key] = {"signature": signature, "html": html}
+        if len(cache) > 6:
+            for old_key in list(cache):
+                if old_key != key:
+                    del cache[old_key]
+                    break
+    html = cache[key]["html"]
+    # stateとtriggerを同名にしない。以前はdefaultのaction=Noneがtriggerを隠していた。
     result = facility_map_component()(
         key=key, data={"html": html, "token": token, "height": height,
                        "render_hash": hashlib.sha256(html.encode()).hexdigest()},
-        default={"action": None}, on_action_change=lambda: None)
+        default={"action": None, "diagnostic": None}, on_action_change=lambda: None,
+        on_diagnostic_change=lambda: None)
+    diagnostic = result.diagnostic
+    if isinstance(diagnostic, dict) and diagnostic.get("event_id") != st.session_state.get("diagnostic_" + key):
+        st.session_state["diagnostic_" + key] = diagnostic.get("event_id")
+        kind = diagnostic.get("event")
+        if kind in ("marker_open", "map_frame_loaded", "map_javascript_error", "map_action_timeout"):
+            audit(kind, status="error" if kind.endswith(("error", "timeout")) else "ok", facility_id=diagnostic.get("facility_id"), event_id=diagnostic.get("event_id"), stage="map_frame")
     handle_facility_map_action(result.action, go, key)
 
 
@@ -1278,8 +1565,8 @@ def render_home(go):
         go("map", open_air="1")
     if st.button("📖  スタンプ帳", key="home_stampbook", width="stretch"):
         go("stampbook")
-    if st.button("📷  行ってきた！", key="home_visit", width="stretch"):
-        go("stampbook", action="record")
+    if st.button("✍️ 訪問済みの写真・感想", key="home_visit", width="stretch"):
+        go("stampbook")
 
     visits = list_visits()
     unique_facilities = {str(v.get("facility_id")) for v in visits}
@@ -1430,6 +1717,12 @@ def render_location_filter():
 def render_map(go):
     st.markdown("# 🗺️ 地図から探す")
     render_data_settings()
+    notice = st.session_state.pop("visit_mark_notice", None)
+    if notice:
+        st.success(notice)
+    error = st.session_state.pop("map_action_error", None)
+    if error:
+        st.error(error)
     facilities = list_facilities()
     visited = visited_facility_ids()
 
@@ -1549,8 +1842,18 @@ def _detail(go, facility_id: str):
     if str(f.get("website_url") or "").startswith(("https://", "http://")):
         st.link_button("公式サイト", str(f.get("website_url")), width="stretch")
 
-    if st.button("📷 この施設で『行ってきた！』", type="primary", width="stretch"):
-        go("stampbook", action="record", facility_id=facility_id)
+    if not visits and st.button("📷 行ってきた！", type="primary", width="stretch"):
+        begin_ui_action("detail_visit", facility_id=facility_id)
+        try:
+            mark_facility_visited(facility_id)
+            st.session_state["visit_mark_notice"] = "訪問済みにしました。"
+            flush_activity_logs()
+            st.rerun()
+        except Exception as exc:
+            audit_error("detail_visit_failed", exc, facility_id=facility_id)
+            st.error("訪問済みにできませんでした。")
+    if visits and st.button("写真・感想を入力（スタンプ帳）", width="stretch"):
+        go("stampbook", facility_id=facility_id)
 
     st.markdown("### 訪問記録")
     if not visits:
@@ -1572,6 +1875,7 @@ def render_facilities(go):
         return
 
     st.markdown("# お風呂を探す")
+    render_activity_logs()
     render_data_settings()
     st.caption("施設名や区名から、行きたいお風呂を探せます。")
     facilities = list_facilities()
@@ -1610,94 +1914,19 @@ def _normalize_photo(raw: bytes) -> bytes:
 
 
 def render_visit(go):
-    st.markdown("# 📷 行ってきた！")
-    facilities = list_facilities()
-    if not facilities:
-        st.warning("施設一覧をまだ取得できていません。「その他」から施設一覧を検索して更新してください。")
-        return
-
-    entry = st.session_state.setdefault("visit_entry_token", str(uuid4()))
-    preselected = st.query_params.get("facility_id", "")
-    labels = {str(f.get("id")): facility_label(f) for f in facilities}
-    ids = list(labels)
-    initial = ids.index(preselected) if preselected in ids else 0
-
-    st.markdown("### 1　訪問した施設を選ぶ")
-    facility_id = st.selectbox(
-        "施設",
-        ids,
-        index=initial,
-        format_func=lambda x: labels[x],
-        label_visibility="collapsed", key="visit_facility_" + entry,
-    )
-
-    st.markdown("### 2　写真を撮影／選択")
-    mode = st.radio("写真の追加方法", ["カメラで撮る", "写真を選ぶ"], horizontal=False, key="visit_mode_" + entry)
-    if mode == "カメラで撮る":
-        st.caption("カメラの使用を許可してください。写真を選ぶ方法も使えます。")
-    uploaded = (
-        st.camera_input("銭湯・施設前で1枚", label_visibility="collapsed", key="visit_camera_" + entry)
-        if mode == "カメラで撮る"
-        else st.file_uploader(
-            "写真を選ぶ",
-            type=["jpg", "jpeg", "png", "webp"],
-            label_visibility="collapsed", key="visit_upload_" + entry,
-        )
-    )
-
-    st.markdown("### 3　訪問日")
-    visited_date = st.date_input("訪問日", value=datetime.now(ZoneInfo("Asia/Tokyo")).date(), label_visibility="collapsed", key="visit_date_" + entry)
-
-    st.markdown("### 4　スタンプを押す")
-    if st.button("○たい　スタンプを押す！", type="primary", width="stretch"):
-        if uploaded is None:
-            st.warning("銭湯前の写真を1枚追加してね")
-            return
-        try:
-            import hashlib
-            fingerprint = hashlib.sha256(uploaded.getvalue() + facility_id.encode() + visited_date.isoformat().encode()).hexdigest()
-            if fingerprint == st.session_state.get("last_saved_fingerprint"):
-                st.info("この写真・施設・訪問日は保存済みです。")
-                return
-            original = _normalize_photo(uploaded.getvalue())
-            stamped = add_visit_stamp(original, visited_date.isoformat(), position="bottom_right")
-            create_visit(facility_id, visited_date.isoformat(), original, stamped)
-            st.session_state["last_saved_fingerprint"] = fingerprint
-            st.session_state["last_stamped_photo"] = stamped
-            st.session_state["last_visit_facility"] = labels[facility_id]
-            st.session_state["stampbook_notice"] = "たい！訪問記録をスタンプ帳に保存しました。"
-            st.session_state["stampbook_sort"] = "新しい順"
-            go("stampbook")
-        except Exception as exc:
-            st.error("訪問記録を保存できませんでした。写真を確認して、もう一度お試しください。")
-            LOGGER.exception("訪問登録失敗")
-
-    if st.session_state.get("last_stamped_photo"):
-        st.image(
-            st.session_state["last_stamped_photo"],
-            caption=st.session_state.get("last_visit_facility", ""),
-            width="stretch",
-        )
-        if st.button("スタンプ帳を見る", width="stretch"):
-            go("stampbook")
-
-    if st.button("← スタンプ帳へ戻る", key="back_from_visit", width="stretch"):
-        go("stampbook")
+    go("stampbook")
 
 
 def render_stampbook(go):
-    if st.query_params.get("action") == "record":
-        render_visit(go)
-        return
     st.markdown("# 📖 スタンプ帳")
     notice = st.session_state.pop("stampbook_notice", None)
     if notice:
         st.success(notice)
-    if st.button("📷 行ってきた！を記録", type="primary", key="stampbook_new_visit", width="stretch"):
-        go("stampbook", action="record")
     visits = list_visits()
     if not visits:
-        st.info("まだスタンプがありません。『行ってきた！』から最初の1湯を記録できます。")
+        st.info("まだ訪問済みの施設がありません。地図の「行ってきた！」を押すと、ここに表示されます。")
+        if st.button("地図へ", key="empty_book_map", width="stretch"):
+            go("map")
         return
 
     st.session_state.setdefault("stampbook_sort", "新しい順")
@@ -1732,11 +1961,38 @@ def render_stampbook(go):
                 st.image(url, width="stretch")
             st.markdown(f"### {f.get('name','施設名未取得')}")
             st.caption(f"○たい　{f.get('ward','')}　{visit.get('visited_date','')}")
+            note = read_visit_note(str(visit["id"]))
+            if note:
+                st.write(note)
+            expanded = st.query_params.get("facility_id") == str(visit.get("facility_id"))
+            with st.expander("写真・感想を入力／編集", expanded=expanded):
+                with st.form("visit_content_" + str(visit["id"])):
+                    day = st.date_input("訪問日", value=datetime.fromisoformat(str(visit["visited_date"])).date(), key="day_" + str(visit["id"]))
+                    text = st.text_area("感想・メモ", value=note or "", key="note_" + str(visit["id"]), disabled=note is None)
+                    if note is None:
+                        st.warning("保存済みの感想を読み込めません。上書きを防ぐため保存を停止しています。")
+                    photo = st.file_uploader("写真を追加・差し替え（任意）", type=["jpg", "jpeg", "png", "webp"], key="photo_" + str(visit["id"]))
+                    if st.form_submit_button("内容を保存", width="stretch", disabled=note is None):
+                        begin_ui_action("visit_content_save", facility_id=str(visit["facility_id"]))
+                        try:
+                            save_visited_content(visit, day, text, photo.getvalue() if photo else None)
+                            st.session_state["stampbook_notice"] = "写真・感想を保存しました。"
+                            flush_activity_logs()
+                            st.rerun()
+                        except Exception as exc:
+                            audit_error("visit_content_failed", exc, visit_id=str(visit["id"]))
+                            st.error("内容を保存できませんでした。入力は残しています。動作ログを確認してください。")
             if st.button("詳しく見る", key=f"stamp_{visit.get('id')}", width="stretch"):
                 go("facilities", facility_id=str(visit.get("facility_id")))
 
 # ── 5. 画面遷移・起動 ──
 def go(page: str, **params: str) -> None:
+    trace = st.session_state.get("pending_ui_trace")
+    forwarded = st.session_state.pop("forwarded_map_trace", None)
+    if not trace or forwarded != trace["id"]:
+        begin_ui_action("navigation", facility_id=params.get("facility_id"))
+    audit("navigation_requested", from_view=st.query_params.get("view", "home"), to_view=page, facility_id=params.get("facility_id"))
+    flush_activity_logs()
     st.session_state.pop("last_stamped_photo", None)
     st.session_state.pop("last_visit_facility", None)
     if page == "visit" or (page == "stampbook" and params.get("action") == "record"):
@@ -1765,21 +2021,39 @@ def main() -> None:
     st.set_page_config(page_title="まるたいスタンプラリー", page_icon="♨️", layout="centered", initial_sidebar_state="collapsed")
     st.markdown(CSS, unsafe_allow_html=True)
     require_access()
+    run_started = time.perf_counter()
+    if not st.session_state.get("audit_initial_screen"):
+        st.session_state["audit_initial_screen"] = True
+        begin_ui_action("initial_screen")
     st.session_state["run_data"] = {}
     # 旧URLのpageにも互換対応。
     page = st.query_params.get("view", st.query_params.get("page", "home"))
     routes = {"home": render_home, "map": render_map, "facilities": render_facilities,
               "visit": render_visit, "stampbook": render_stampbook}
+    screen = "facility_detail" if page == "facilities" and st.query_params.get("facility_id") else page
+    state_snapshot = {"view": page, "facility_id": st.query_params.get("facility_id"),
+                      "wards": st.session_state.get("map_selected_wards", []),
+                      "radius_on": st.session_state.get("use_current_radius", False),
+                      "radius_km": st.session_state.get("current_radius_km")}
+    old_snapshot = st.session_state.get("last_ui_snapshot")
+    if old_snapshot and old_snapshot != state_snapshot:
+        audit("ui_state_changed", changed=[k for k in state_snapshot if state_snapshot[k] != old_snapshot.get(k)])
+    st.session_state["last_ui_snapshot"] = state_snapshot
     try:
         ensure_initial_facilities()
         routes.get(page, render_home)(go)
-    except Exception:
+        audit("screen_rendered", to_view=screen, stage="server_render", facility_id=st.query_params.get("facility_id"), elapsed_ms=(time.perf_counter()-run_started)*1000)
+    except Exception as exc:
+        audit_error("screen_error", exc, to_view=screen, facility_id=st.query_params.get("facility_id"), elapsed_ms=(time.perf_counter()-run_started)*1000)
+        screen = "error:" + screen
         LOGGER.exception("画面の読み込みに失敗: %s", page)
         st.error("データを読み込めませんでした。接続と初期設定を確認し、再読み込みしてください。")
         if st.button("再読み込み"):
             st.rerun()
     st.caption(f"施設一覧：[{FACILITY_CREDIT}]({FACILITY_LIST_URL}) / CC BY 4.0・23区を抽出。位置：国土地理院の住所検索。")
     bottom_nav("stampbook" if page == "visit" else page if page in routes else "home")
+    report_display_timing(screen)
+    flush_activity_logs()
 
 
 if __name__ == "__main__":
