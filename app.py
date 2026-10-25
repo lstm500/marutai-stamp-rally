@@ -1153,7 +1153,7 @@ def build_facility_map(
         if visited:
             marker_html = """
             <div style='width:42px;height:42px;border-radius:50%;background:#d9362b;color:white;
-            border:4px solid #fff7e8;box-shadow:0 2px 8px #0003;display:flex;align-items:center;
+            border:4px solid #ffd54f;box-shadow:0 2px 8px #0005;display:flex;align-items:center;
             justify-content:center;font-weight:900;font-size:15px;font-family:sans-serif;'>たい</div>
             """
         else:
@@ -1172,7 +1172,7 @@ def build_facility_map(
         open_air = feature_text("露天風呂", facility.get("has_open_air_bath"))
         natural = feature_text("天然温泉", facility.get("has_natural_hot_spring"))
 
-        detail_url = f"?view=facilities&facility_id={quote(fid, safe='')}"
+        safe_fid = escape(fid, quote=True)
 
         popup_html = f"""
         <div style="font-family:-apple-system,BlinkMacSystemFont,'Yu Gothic',sans-serif;color:#173a5e;min-width:190px;line-height:1.55;">
@@ -1180,7 +1180,8 @@ def build_facility_map(
           <div style="font-size:13px;">{ward}<br>施設種別：{category}</div>
           <div style="font-size:13px;font-weight:700;color:{'#d9362b' if visited else '#173a5e'};">{visit_text}</div>
           <div style="font-size:12px;margin-top:5px;">♨ {escape(open_air)}<br>♨ {escape(natural)}</div>
-          <a href="{detail_url}" target="_top" style="display:block;margin-top:8px;padding:7px 10px;border-radius:9px;background:#d9362b;color:#fff;text-align:center;text-decoration:none;font-weight:800;font-size:13px;">詳しく見る</a>
+          <button type="button" data-marutai-action="detail" data-facility-id="{safe_fid}" style="display:block;width:100%;min-height:42px;margin-top:8px;padding:8px 10px;border:0;border-radius:9px;background:#d9362b;color:#fff;font-weight:800;font-size:14px;cursor:pointer;">詳しく見る</button>
+          <button type="button" data-marutai-action="visit" data-facility-id="{safe_fid}" style="display:block;width:100%;min-height:42px;margin-top:7px;padding:8px 10px;border:1px solid #d9362b;border-radius:9px;background:#fff4ee;color:#173a5e;font-weight:800;font-size:14px;cursor:pointer;">📷 行ってきた！</button>
         </div>
         """
         folium.Marker(
@@ -1191,6 +1192,80 @@ def build_facility_map(
         ).add_to(m)
 
     return m
+
+# 地図内ボタンはiframeの外へ直接移動せず、アプリへ操作を通知する。
+@st.cache_resource(show_spinner=False)
+def facility_map_component():
+    return st.components.v2.component(
+        "marutai_facility_map_actions",
+        html='<iframe title="施設地図" sandbox="allow-scripts allow-same-origin allow-popups" style="display:block;width:100%;border:0;border-radius:16px;"></iframe>',
+        js="""
+        export default function({ parentElement, data, setTriggerValue }) {
+          const frame = parentElement.querySelector('iframe');
+          frame.style.height = `${data.height}px`;
+          const receive = event => {
+            const message = event.data;
+            if (event.source !== frame.contentWindow || !message ||
+                message.type !== 'marutai-map-action' || message.token !== data.token) return;
+            if (!['detail', 'visit'].includes(message.action) || typeof message.facility_id !== 'string') return;
+            setTriggerValue('action', {action:message.action, facility_id:message.facility_id,
+                                      event_id:message.event_id});
+          };
+          window.addEventListener('message', receive);
+          if (frame.dataset.renderHash !== data.render_hash) {
+            frame.dataset.renderHash = data.render_hash;
+            frame.srcdoc = data.html;
+          }
+          return () => window.removeEventListener('message', receive);
+        }
+        """,
+    )
+
+
+def handle_facility_map_action(action, go, key):
+    if not isinstance(action, dict) or action.get("action") not in ("detail", "visit"):
+        return
+    fid = str(action.get("facility_id", ""))
+    event_id = action.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return
+    seen = st.session_state.setdefault("map_actions_seen", {})
+    if seen.get(key) == event_id:
+        return
+    if not get_facility(fid):
+        st.warning("施設情報が見つかりません。地図を開き直してください。")
+        return
+    seen[key] = event_id
+    if action["action"] == "detail":
+        go("facilities", facility_id=fid)
+    else:
+        go("stampbook", action="record", facility_id=fid)
+
+
+def render_interactive_facility_map(facility_map, go, *, key, height=455):
+    import json
+    import hashlib
+    token = st.session_state.setdefault("map_token_" + key, str(uuid4()))
+    # popup内のボタンを開いた後も、documentのイベント委譲でタップを受け取る。
+    bridge = """
+    document.addEventListener('click', function(event) {
+      const button = event.target.closest('[data-marutai-action]');
+      if (!button) return;
+      event.preventDefault();
+      event.stopPropagation();
+      window.parent.postMessage({type:'marutai-map-action', token:TOKEN,
+        action:button.dataset.marutaiAction, facility_id:button.dataset.facilityId,
+        event_id:Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)}, '*');
+    }, true);
+    """.replace("TOKEN", json.dumps(token))
+    facility_map.get_root().script.add_child(folium.Element(bridge))
+    html = facility_map.get_root().render()
+    result = facility_map_component()(
+        key=key, data={"html": html, "token": token, "height": height,
+                       "render_hash": hashlib.sha256(html.encode()).hexdigest()},
+        default={"action": None}, on_action_change=lambda: None)
+    handle_facility_map_action(result.action, go, key)
+
 
 # ── 4. 画面 ──
 def render_home(go):
@@ -1204,7 +1279,7 @@ def render_home(go):
     if st.button("📖  スタンプ帳", key="home_stampbook", width="stretch"):
         go("stampbook")
     if st.button("📷  行ってきた！", key="home_visit", width="stretch"):
-        go("visit")
+        go("stampbook", action="record")
 
     visits = list_visits()
     unique_facilities = {str(v.get("facility_id")) for v in visits}
@@ -1405,6 +1480,7 @@ def render_map(go):
         filtered.sort(key=lambda f: facility_distance(f, origin))
     located = sum(f.get("latitude") is not None and f.get("longitude") is not None for f in filtered)
     st.caption(f"検索結果：{len(filtered)}施設 ｜ 地図：{located}施設 ｜ 位置未確認：{len(filtered)-located}施設")
+    st.caption("未訪問：濃紺・白い枠　／　訪問済み：朱赤・金色の枠")
     facility_map = build_facility_map(filtered, visited, zoom_start=DEFAULT_MAP_ZOOM, fit_23_wards=False)
     # 検索結果の偏りでは初期縮尺・初期中心を変えない。
     facility_map.location = list(DEFAULT_MAP_CENTER)
@@ -1418,12 +1494,7 @@ def render_map(go):
                             tooltip="取得した現在地").add_to(facility_map)
         facility_map.fit_bounds(circle.get_bounds(), padding=(20, 20), max_zoom=16)
         st.caption(f"現在地から半径{radius_km:g}km以内 ｜ 近い順 ｜ 位置未確認の施設は半径検索の対象外です。")
-    st_folium(
-        facility_map,
-        width=None,
-        height=455,
-        returned_objects=[],
-    )
+    render_interactive_facility_map(facility_map, go, key="facility_search_map", height=455)
 
     st.markdown("### 施設一覧")
     for f in filtered:
@@ -1469,12 +1540,9 @@ def _detail(go, facility_id: str):
     )
 
     if f.get("latitude") not in (None, "") and f.get("longitude") not in (None, ""):
-        st_folium(
+        render_interactive_facility_map(
             build_facility_map([f], {facility_id} if visits else set(), zoom_start=15, fit_23_wards=False),
-            width=None,
-            height=300,
-            returned_objects=[],
-        )
+            go, key="facility_detail_map_" + facility_id, height=300)
     else:
         st.info("緯度・経度が未登録のため地図は表示できません。")
 
@@ -1482,7 +1550,7 @@ def _detail(go, facility_id: str):
         st.link_button("公式サイト", str(f.get("website_url")), width="stretch")
 
     if st.button("📷 この施設で『行ってきた！』", type="primary", width="stretch"):
-        go("visit", facility_id=facility_id)
+        go("stampbook", action="record", facility_id=facility_id)
 
     st.markdown("### 訪問記録")
     if not visits:
@@ -1548,6 +1616,7 @@ def render_visit(go):
         st.warning("施設一覧をまだ取得できていません。「その他」から施設一覧を検索して更新してください。")
         return
 
+    entry = st.session_state.setdefault("visit_entry_token", str(uuid4()))
     preselected = st.query_params.get("facility_id", "")
     labels = {str(f.get("id")): facility_label(f) for f in facilities}
     ids = list(labels)
@@ -1559,25 +1628,25 @@ def render_visit(go):
         ids,
         index=initial,
         format_func=lambda x: labels[x],
-        label_visibility="collapsed",
+        label_visibility="collapsed", key="visit_facility_" + entry,
     )
 
     st.markdown("### 2　写真を撮影／選択")
-    mode = st.radio("写真の追加方法", ["カメラで撮る", "写真を選ぶ"], horizontal=False)
+    mode = st.radio("写真の追加方法", ["カメラで撮る", "写真を選ぶ"], horizontal=False, key="visit_mode_" + entry)
     if mode == "カメラで撮る":
         st.caption("カメラの使用を許可してください。写真を選ぶ方法も使えます。")
     uploaded = (
-        st.camera_input("銭湯・施設前で1枚", label_visibility="collapsed")
+        st.camera_input("銭湯・施設前で1枚", label_visibility="collapsed", key="visit_camera_" + entry)
         if mode == "カメラで撮る"
         else st.file_uploader(
             "写真を選ぶ",
             type=["jpg", "jpeg", "png", "webp"],
-            label_visibility="collapsed",
+            label_visibility="collapsed", key="visit_upload_" + entry,
         )
     )
 
     st.markdown("### 3　訪問日")
-    visited_date = st.date_input("訪問日", value=datetime.now(ZoneInfo("Asia/Tokyo")).date(), label_visibility="collapsed")
+    visited_date = st.date_input("訪問日", value=datetime.now(ZoneInfo("Asia/Tokyo")).date(), label_visibility="collapsed", key="visit_date_" + entry)
 
     st.markdown("### 4　スタンプを押す")
     if st.button("○たい　スタンプを押す！", type="primary", width="stretch"):
@@ -1596,7 +1665,9 @@ def render_visit(go):
             st.session_state["last_saved_fingerprint"] = fingerprint
             st.session_state["last_stamped_photo"] = stamped
             st.session_state["last_visit_facility"] = labels[facility_id]
-            st.success("たい！またひとつ増えたよ！")
+            st.session_state["stampbook_notice"] = "たい！訪問記録をスタンプ帳に保存しました。"
+            st.session_state["stampbook_sort"] = "新しい順"
+            go("stampbook")
         except Exception as exc:
             st.error("訪問記録を保存できませんでした。写真を確認して、もう一度お試しください。")
             LOGGER.exception("訪問登録失敗")
@@ -1610,18 +1681,30 @@ def render_visit(go):
         if st.button("スタンプ帳を見る", width="stretch"):
             go("stampbook")
 
+    if st.button("← スタンプ帳へ戻る", key="back_from_visit", width="stretch"):
+        go("stampbook")
+
+
 def render_stampbook(go):
+    if st.query_params.get("action") == "record":
+        render_visit(go)
+        return
     st.markdown("# 📖 スタンプ帳")
+    notice = st.session_state.pop("stampbook_notice", None)
+    if notice:
+        st.success(notice)
+    if st.button("📷 行ってきた！を記録", type="primary", key="stampbook_new_visit", width="stretch"):
+        go("stampbook", action="record")
     visits = list_visits()
     if not visits:
         st.info("まだスタンプがありません。『行ってきた！』から最初の1湯を記録できます。")
         return
 
+    st.session_state.setdefault("stampbook_sort", "新しい順")
     sort_mode = st.segmented_control(
         "並べ替え",
         ["新しい順", "古い順", "区ごと", "施設名順"],
-        default="新しい順",
-        selection_mode="single",
+        selection_mode="single", key="stampbook_sort",
     )
 
     def name(v):
@@ -1639,6 +1722,7 @@ def render_stampbook(go):
     else:
         visits = sorted(visits, key=lambda v: str(v.get("visited_date", "")), reverse=True)
 
+    st.caption(f"訪問した施設：{len({str(v.get('facility_id')) for v in visits})}湯 ｜ 訪問記録：{len(visits)}件")
     # スマホ最優先のため1列表示。360px幅でも写真・文字・ボタンを潰さない。
     for visit in visits:
         f = visit.get("facilities") or {}
@@ -1655,6 +1739,8 @@ def render_stampbook(go):
 def go(page: str, **params: str) -> None:
     st.session_state.pop("last_stamped_photo", None)
     st.session_state.pop("last_visit_facility", None)
+    if page == "visit" or (page == "stampbook" and params.get("action") == "record"):
+        st.session_state["visit_entry_token"] = str(uuid4())
     st.query_params.clear()
     st.query_params["view"] = page
     for key, value in params.items():
@@ -1693,7 +1779,7 @@ def main() -> None:
         if st.button("再読み込み"):
             st.rerun()
     st.caption(f"施設一覧：[{FACILITY_CREDIT}]({FACILITY_LIST_URL}) / CC BY 4.0・23区を抽出。位置：国土地理院の住所検索。")
-    bottom_nav(page if page in routes else "home")
+    bottom_nav("stampbook" if page == "visit" else page if page in routes else "home")
 
 
 if __name__ == "__main__":
