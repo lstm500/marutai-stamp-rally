@@ -27,7 +27,7 @@ ASSET_DIR = ROOT / "assets"
 STAMP_PATH = ASSET_DIR / "tai_stamp.png"
 BUCKET = "visit-photos"
 LOGGER = logging.getLogger("marutai")
-APP_VERSION = "2026-10-25-shadowroot-log-fix"
+APP_VERSION = "2026-10-25-events"
 
 # 公開一覧の取得済みデータ。出典・取得日・設備不明の扱いは検索設定欄に表示。
 # 2026-10-25に検索取得し、既存facilities形式へ変換した初期データ。
@@ -542,7 +542,7 @@ input::placeholder, textarea::placeholder {
 }
 .st-key-bottom_nav > div { max-width:740px; margin:auto; }
 .st-key-bottom_nav [data-testid="stHorizontalBlock"] { flex-wrap:nowrap !important; gap:4px !important; }
-.st-key-bottom_nav [data-testid="stColumn"] { min-width:0 !important; width:25% !important; flex:1 1 0 !important; }
+.st-key-bottom_nav [data-testid="stColumn"] { min-width:0 !important; width:20% !important; flex:1 1 0 !important; }
 .st-key-bottom_nav button { padding:4px !important; font-size:.75rem !important; min-height:46px; }
 /* Map iframe */
 [data-testid="stIFrame"] { border-radius:16px; overflow:hidden; }
@@ -1219,6 +1219,266 @@ def render_data_settings() -> None:
         st.caption("位置情報：国土地理院の住所検索。住所との完全一致を確認して採用。現地の入口位置とは差が生じる場合があります。")
 
 
+# ── 公式イベント検索（外部アクセスはホームの検索ボタン押下時だけ） ──
+EVENT_CACHE_PATH = "events/official-v1.json"
+EVENT_FEEDS = (
+    "https://www.1010.or.jp/category/info/event/feed/",
+    "https://www.1010.or.jp/category/mag/topic/feed/",
+)
+
+
+def event_blocks(html):
+    """RSS本文/記事から段落・見出し・表の行を取得。画像本文は推測しない。"""
+    from html.parser import HTMLParser
+    class Blocks(HTMLParser):
+        def __init__(self):
+            super().__init__(); self.rows = []; self.parts = []; self.hidden = 0
+        def flush(self):
+            text = " ".join("".join(self.parts).split())
+            if text: self.rows.append(text)
+            self.parts = []
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"): self.hidden += 1
+            if tag in ("p", "h1", "h2", "h3", "h4", "li", "tr"): self.flush()
+            if tag in ("br", "td", "th"): self.parts.append(" ")
+        def handle_endtag(self, tag):
+            if tag in ("script", "style"): self.hidden = max(0, self.hidden-1)
+            if tag in ("p", "h1", "h2", "h3", "h4", "li", "tr"): self.flush()
+        def handle_data(self, data):
+            if not self.hidden: self.parts.append(data)
+    parser = Blocks(); parser.feed(html); parser.flush()
+    return parser.rows
+
+
+def event_period(text, year):
+    """明示された日付のみ。終了日を含む。月だけ/定期開催/曜日制限は確定しない。"""
+    import re
+    import unicodedata
+    from datetime import date
+    text = unicodedata.normalize("NFKC", text)
+    if re.search(r"毎[年月週]|第\s*\d|土日を除く|平日のみ|週末|1軒ずつ", text):
+        return None
+    pattern = r"(?:(\d{4})年)?\s*(\d{1,2})月\s*(\d{1,2})日"
+    found = list(re.finditer(pattern, text))
+    if not found: return None
+    first = found[0]
+    try:
+        start = date(int(first[1] or year), int(first[2]), int(first[3]))
+        end = start
+        tail = text[first.end():]
+        # 同月の『11月2日(月)～30日(月)』も扱う。
+        same = re.match(r"\s*(?:\([^)]*\))?\s*[～〜~－-]\s*(\d{1,2})日", tail)
+        if same:
+            end = date(start.year, start.month, int(same[1]))
+        elif len(found) > 1 and re.search(r"[～〜~－-]|から", text[first.end():found[1].start()]):
+            last = found[1]
+            end_year = int(last[1] or (start.year + (int(last[2]) < start.month)))
+            end = date(end_year, int(last[2]), int(last[3]))
+        if end < start: return None
+        # 飛び石の日程を連続開催に変換しない。
+        if len(found) > 1 and end == start: return None
+        return start.isoformat(), end.isoformat()
+    except ValueError:
+        return None
+
+
+def parse_event_article(title, body, url, year, facilities):
+    import re
+    import hashlib
+    blocks = event_blocks(body)
+    ward = None; pending = ""; events = []
+    article_names = re.findall(r"[「『]([^」』]+)[」』]", title)
+    article_title = next((x for x in article_names if re.search(r"スタンプ|ラリー|まつり|湯", x)), title)
+    for text in blocks:
+        heading_wards = [w for w in WARDS if w in text]
+        if (len(text) < 45 and (heading_wards or text.startswith("●"))
+                and not re.search(r"\d.*[月日]|開催|スタンプ|湯まつり", text)):
+            ward = heading_wards[0] if len(heading_wards) == 1 else None
+            pending = ""
+            continue
+        table = re.fullmatch(r"(\d{4}年\d{1,2}月\d{1,2}日)\s+[月火水木金土日]\s+(\S+)\s+(.+)", text)
+        period = event_period(text, year)
+        if re.search(r"年間|年度内|該当する場合|対象外|高齢者.*入浴証", text):
+            continue
+        if not period:
+            if len(text) < 100 and re.search(r"スタンプ|まつり|イベント|ラリー|コラボ|講演|湯[」』]", text):
+                pending = text
+            continue
+        if not table and not re.search(r"開催|実施|スタンプ|まつり|イベント|ラリー|コラボ|[のす]湯|入浴", text):
+            continue
+        context = text
+        quoted = re.findall(r"[「『]([^」』]+)[」』]", text)
+        title_candidates = [x for x in quoted if re.search(r"スタンプ|ラリー|まつり|祭|湯|イベント|割", x)]
+        name = table[3] if table else title_candidates[-1] if title_candidates else (pending or article_title)
+        pending = ""
+        if name == title and url.endswith(("/event-area/", "/event-regular/")):
+            continue
+        # 全国対象/地域だけの記事から参加店を断定しない。
+        named = []
+        for f in facilities:
+            if ward and f.get("ward") != ward: continue
+            fn = str(f.get("name") or "")
+            if len(fn) >= 3 and fn in context:
+                # 同名銭湯は区を確認できるときのみ紐付ける。
+                if ward or f.get("ward") in context or sum(x.get("name") == fn for x in facilities) == 1:
+                    named.append(str(f["id"]))
+        regional = (table[2] if table and table[2] in WARDS else None) if table else ward
+        if not regional:
+            explicit_wards = [w for w in WARDS if w + "内" in context]
+            regional = explicit_wards[0] if len(explicit_wards) == 1 else None
+        if named:
+            ids = named; confidence = "named"
+        elif regional and not re.search(r"一部|指定|チラシ|1軒ずつ|対象店舗|参加店舗.*参照|区内の[0-9]+軒", context):
+            ids = [str(f["id"]) for f in facilities if f.get("ward") == regional and f.get("category") == "sento"]
+            confidence = "area"
+        else:
+            ids = []; confidence = "unmatched"
+        eid = hashlib.sha256((url + name + period[0] + str(regional)).encode()).hexdigest()[:20]
+        events.append({"id": eid, "title": name[:180], "start": period[0], "end": period[1],
+                       "url": url, "ward": regional, "facility_ids": ids, "confidence": confidence})
+    return events
+
+
+def load_event_snapshot():
+    if "event_snapshot" not in st.session_state:
+        try:
+            value = _json.loads(db().storage.from_(BUCKET).download(EVENT_CACHE_PATH).decode("utf-8"))
+            if not isinstance(value.get("events"), list): raise ValueError("イベント保存形式が不正です。")
+            st.session_state["event_snapshot"] = value
+        except Exception as exc:
+            st.session_state["event_snapshot"] = {"events": [], "checked_at": None}
+            code = getattr(exc, "status", getattr(exc, "status_code", None))
+            if str(code) != "404" and "not found" not in str(exc).lower() and "not_found" not in str(exc).lower():
+                audit_error("event_cache_read_failed", exc)
+    return st.session_state["event_snapshot"]
+
+
+def refresh_events():
+    """ボタン1回につきRSS2本。RSS本文を解析し記事ごとの追加取得を避ける。"""
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    from concurrent.futures import ThreadPoolExecutor
+    started = time.perf_counter()
+    old = load_event_snapshot()
+    facilities = list_facilities()
+    events = []; sources = []; failures = []
+    audit("event_search_started", count=len(EVENT_FEEDS))
+    def fetch(url):
+        try: return url, public_json_or_text(url), None
+        except Exception as exc: return url, None, exc
+    with st.spinner("公式のイベント情報を検索しています…"):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(fetch, EVENT_FEEDS))
+        for feed, raw, error in results:
+            if error:
+                failures.append(feed); audit_error("event_source_failed", error, source=feed); continue
+            try:
+                root = ET.fromstring(raw)
+                items = root.findall("./channel/item")
+                if not items: raise ValueError("公式イベントRSSの記事がありません。")
+                for item in items:
+                    title = item.findtext("title") or "イベント"
+                    url = item.findtext("link") or ""
+                    from urllib.parse import urlparse
+                    if urlparse(url).hostname not in ("www.1010.or.jp", "1010.or.jp"): continue
+                    if url.endswith(("/event-regular/", "/event-sdgs/")) or any(x in title for x in ("銭湯検定", "YouTube", "動画公開")): continue
+                    body = item.findtext("{http://purl.org/rss/1.0/modules/content/}encoded") or item.findtext("description") or ""
+                    try: year = parsedate_to_datetime(item.findtext("pubDate")).year
+                    except Exception: year = datetime.now(ZoneInfo("Asia/Tokyo")).year
+                    events.extend(parse_event_article(title, body, url, year, facilities))
+                sources.append(feed)
+                audit("event_source_searched", source=feed, count=len(items), elapsed_ms=(time.perf_counter()-started)*1000)
+            except Exception as exc:
+                failures.append(feed); audit_error("event_source_failed", exc, source=feed)
+    if not sources:
+        st.session_state["event_search_notice"] = "イベントを検索できませんでした。前回の結果を表示しています。"
+        audit("event_search_failed", status="error", elapsed_ms=(time.perf_counter()-started)*1000)
+        return
+    # 部分障害では、取得できなかった記事の前回データを失わない。
+    if failures: events.extend(old.get("events", []))
+    unique = {}
+    for event in events:
+        key = (event["title"].replace(" ", ""), event["start"], event["end"], event.get("ward"))
+        if key not in unique or (event["confidence"] == "named" and unique[key]["confidence"] != "named"):
+            unique[key] = event
+    snapshot = {"schema_version": 1, "checked_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(),
+                "partial": bool(failures), "events": list(unique.values())}
+    st.session_state["event_snapshot"] = snapshot
+    st.session_state["event_search_notice"] = "一部の取得に失敗しました。取得済みのイベントを表示します。" if failures else ""
+    try:
+        db().storage.from_(BUCKET).upload(EVENT_CACHE_PATH, _json.dumps(snapshot, ensure_ascii=False).encode(),
+            file_options={"content-type": "application/json", "upsert": "true"})
+    except Exception as exc:
+        audit_error("event_cache_save_failed", exc)
+        st.session_state["event_search_notice"] = "検索結果は表示できますが、保存に失敗しました。次回起動時には前回の結果が表示される場合があります。"
+    st.session_state.pop("map_html_cache", None)
+    audit("event_search_completed", status="partial" if failures else "ok", count=len(snapshot["events"]), elapsed_ms=(time.perf_counter()-started)*1000)
+
+
+def current_events(*, include_upcoming=False):
+    today = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
+    return [e for e in load_event_snapshot().get("events", [])
+            if e.get("end", "") >= today and (include_upcoming or e.get("start", "9999") <= today)]
+
+
+def facility_events(facility_id):
+    return [e for e in current_events() if str(facility_id) in e.get("facility_ids", [])]
+
+
+def event_popup_html(events):
+    parts = []
+    for event in events:
+        note = "地域イベント・店舗の参加は公式案内で確認" if event["confidence"] == "area" else "イベント開催期間中"
+        parts.append(f'<div style="margin-top:8px;padding:7px;background:#f3e8ff;border-radius:8px;">'
+                     f'<b>🎪 {escape(event["title"])}</b><br>{escape(event["start"])} ～ {escape(event["end"])}'
+                     f'<br><small>{note}</small><br><a href="{escape(event["url"], quote=True)}" target="_blank" rel="noopener noreferrer">公式のイベント内容を見る ↗</a></div>')
+    return "".join(parts)
+
+
+def render_event_status():
+    snapshot = load_event_snapshot()
+    if snapshot.get("checked_at"):
+        st.caption("イベント最終検索：" + snapshot["checked_at"][:16].replace("T", " ") + "（日本時間）")
+    else:
+        st.caption("イベント情報はホームの「地図から探す」「露天風呂を探す」を押すと検索します。")
+    notice = st.session_state.get("event_search_notice")
+    if notice:
+        st.warning(notice)
+    elif snapshot.get("partial"):
+        st.warning("前回の検索では一部の情報を取得できませんでした。取得済みの結果を表示しています。")
+
+
+def render_events(go):
+    st.markdown("# 🎪 イベント")
+    render_event_status()
+    st.caption("公式RSSで日付を確認できた開催中・開催予定の情報です。地域の案内は店舗ごとの参加・実施日をご確認ください。画像のみの案内やSNS限定の催しは取得対象外です。")
+    upcoming = st.checkbox("開催予定も表示", value=True, key="events_upcoming")
+    events = sorted(current_events(include_upcoming=upcoming), key=lambda e: (e["start"], e["title"]))
+    facilities = {str(f["id"]): f for f in list_facilities()}
+    if not events:
+        st.info("表示できるイベントはありません。ホームの検索ボタンから最新情報を取得できます。")
+    for event in events:
+        with st.container(border=True):
+            st.markdown("### " + escape(event["title"]))
+            today = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
+            st.write(("開催予定" if event["start"] > today else "開催期間中") + f' ｜ {event["start"]} ～ {event["end"]}')
+            st.link_button("公式のイベント内容を見る ↗", event["url"], width="stretch")
+            linked = [facilities[fid] for fid in event["facility_ids"] if fid in facilities]
+            if event["confidence"] == "area": st.caption("対象地域の銭湯一覧です。各店の参加・実施日は公式案内で確認してください。")
+            if not linked: st.caption("参加施設を特定できないため、地図には色を付けていません。公式案内で参加店をご確認ください。")
+            if linked:
+                with st.expander(f"銭湯を見る（{len(linked)}施設）", expanded=len(linked) <= 3):
+                    for f in linked:
+                        st.write(f'{f["name"]}（{f.get("ward", "")}）')
+                        if f.get("latitude") is not None and f.get("longitude") is not None:
+                            if st.button("地図で見る", key="event_map_" + event["id"] + "_" + str(f["id"]), width="stretch"):
+                                begin_ui_action("event_to_map", facility_id=str(f["id"]))
+                                st.session_state["event_map_focus"] = str(f["id"])
+                                go("map")
+                        else:
+                            st.caption("位置未確認")
+
+
 def feature_text(label: str, value: bool | None) -> str:
     return f"{label} 未登録" if value is None else f"{label}{'あり' if value else 'なし'}"
 
@@ -1438,6 +1698,9 @@ def build_facility_map(
             </div>
             """
 
+        events = facility_events(fid)
+        if events:
+            marker_html = marker_html.replace("background:#173a5e", "background:#7b2cbf").replace("background:#d9362b", "background:#7b2cbf")
         marker_html = marker_html.replace("<div ", '<div data-marutai-marker="' + escape(fid, quote=True) + '" ', 1)
         name = escape(str(facility.get("name", "")))
         ward = escape(str(facility.get("ward", "")))
@@ -1456,13 +1719,14 @@ def build_facility_map(
           <div style="font-size:13px;">{ward}<br>施設種別：{category}</div>
           <div style="font-size:13px;font-weight:700;color:{'#d9362b' if visited else '#173a5e'};">{visit_text}</div>
           <div style="font-size:12px;margin-top:5px;">♨ {escape(open_air)}<br>♨ {escape(natural)}</div>
+          {event_popup_html(events)}
           <button type="button" data-marutai-action="detail" data-facility-id="{safe_fid}" style="display:block;width:100%;min-height:42px;margin-top:8px;padding:8px 10px;border:0;border-radius:9px;background:#d9362b;color:#fff;font-weight:800;font-size:14px;cursor:pointer;">詳しく見る</button>
           <button type="button" data-marutai-action="visit" data-facility-id="{safe_fid}" {visit_button_disabled} style="display:block;width:100%;min-height:42px;margin-top:7px;padding:8px 10px;border:1px solid #d9362b;border-radius:9px;background:#fff4ee;color:#173a5e;font-weight:800;font-size:14px;cursor:pointer;">{visit_button_label}</button>
         </div>
         """
         folium.Marker(
             location=[lat, lon],
-            popup=folium.Popup(popup_html, max_width=280),
+            popup=folium.Popup(popup_html, max_width=300, max_height=340),
             tooltip=name,
             icon=folium.DivIcon(html=marker_html, icon_size=(42, 42), icon_anchor=(21, 36)),
         ).add_to(m)
@@ -1620,8 +1884,14 @@ def render_home(go):
     st.markdown("<div class='hero-question'>今日はどこのお風呂へ行く？</div>", unsafe_allow_html=True)
 
     if st.button("🗺️  地図から探す", key="home_map", type="primary", width="stretch"):
+        refresh_events()
+        st.session_state.pop("event_map_selected", None)
+        st.session_state.pop("viewport_facility_search_map", None)
         go("map")
     if st.button("♨  露天風呂を探す", key="home_open_air", width="stretch"):
+        refresh_events()
+        st.session_state.pop("event_map_selected", None)
+        st.session_state.pop("viewport_facility_search_map", None)
         go("map", open_air="1")
     if st.button("📖  スタンプ帳", key="home_stampbook", width="stretch"):
         go("stampbook")
@@ -1832,8 +2102,10 @@ def render_map(go):
     if use_radius and origin:
         filtered.sort(key=lambda f: facility_distance(f, origin))
     located = sum(f.get("latitude") is not None and f.get("longitude") is not None for f in filtered)
-    st.caption(f"検索結果：{len(filtered)}施設 ｜ 地図：{located}施設 ｜ 位置未確認：{len(filtered)-located}施設")
-    st.caption("未訪問：濃紺・白い枠　／　訪問済み：朱赤・金色の枠")
+    if not (st.session_state.get("event_map_selected") or st.session_state.get("event_map_focus")):
+        st.caption(f"検索結果：{len(filtered)}施設 ｜ 地図：{located}施設 ｜ 位置未確認：{len(filtered)-located}施設")
+    st.caption("未訪問：濃紺 ／ 訪問済み：朱赤・金色枠 ／ イベント開催期間中：紫（地域案内は参加要確認）")
+    render_event_status()
     facility_map = build_facility_map(filtered, visited, zoom_start=DEFAULT_MAP_ZOOM, fit_23_wards=False)
     # 検索結果の偏りでは初期縮尺・初期中心を変えない。
     facility_map.location = list(DEFAULT_MAP_CENTER)
@@ -1847,19 +2119,27 @@ def render_map(go):
                             tooltip="取得した現在地").add_to(facility_map)
         facility_map.fit_bounds(circle.get_bounds(), padding=(20, 20), max_zoom=16)
         st.caption(f"現在地から半径{radius_km:g}km以内 ｜ 近い順 ｜ 位置未確認の施設は半径検索の対象外です。")
+    focus_id = st.session_state.pop("event_map_focus", None)
+    if focus_id:
+        focus = get_facility(focus_id)
+        if focus and focus.get("latitude") is not None and focus.get("longitude") is not None:
+            # イベント一覧の導線では以前の絞り込みに隠れない専用表示を使う。
+            facility_map = build_facility_map([focus], visited, zoom_start=15, fit_23_wards=False)
+            st.session_state["viewport_facility_search_map"] = [float(focus["latitude"]), float(focus["longitude"]), 15]
+            st.session_state["event_map_selected"] = focus_id
+    selected = st.session_state.get("event_map_selected")
+    if selected:
+        focus = get_facility(selected)
+        if focus and focus.get("latitude") is not None and focus.get("longitude") is not None:
+            facility_map = build_facility_map([focus], visited, zoom_start=15, fit_23_wards=False)
+            st.info(f'イベント一覧から選択：{focus["name"]}（この1施設を表示中）')
+            if st.button("通常の検索地図に戻る", key="clear_event_map_focus"):
+                st.session_state.pop("event_map_selected", None)
+                st.session_state.pop("viewport_facility_search_map", None)
+                st.rerun()
     render_interactive_facility_map(facility_map, go, key="facility_search_map", height=455)
 
-    st.markdown("### 施設一覧")
-    for f in filtered:
-        if use_radius and origin:
-            st.caption(f"現在地から直線 {facility_distance(f, origin):.2f}km")
-        render_facility_card(
-            f,
-            str(f.get("id")) in visited,
-            lambda fid: go("facilities", facility_id=fid),
-            "map",
-        )
-    if not filtered:
+    if not filtered and not selected:
         st.info("条件に合う施設はありません。露天風呂・天然温泉が未登録の施設は、該当の絞り込みでは表示されません。")
 
 def _detail(go, facility_id: str):
@@ -1915,6 +2195,10 @@ def _detail(go, facility_id: str):
     if visits and st.button("写真・感想を入力（スタンプ帳）", width="stretch"):
         go("stampbook", facility_id=facility_id)
 
+    events = facility_events(facility_id)
+    if events:
+        st.markdown("### 🎪 イベント")
+        st.markdown(event_popup_html(events), unsafe_allow_html=True)
     st.markdown("### 訪問記録")
     if not visits:
         st.caption("まだ訪問記録はありません。")
@@ -2068,9 +2352,9 @@ def go(page: str, **params: str) -> None:
 def bottom_nav(active: str) -> None:
     # Streamlitボタンで移動し、認証・入力状態を保つ。
     with st.container(key="bottom_nav"):
-        cols = st.columns(4)
+        cols = st.columns(5)
         for col, (page, label) in zip(cols, [("home", "⌂ ホーム"), ("map", "🗺 地図"),
-                                           ("stampbook", "▣ スタンプ帳"), ("facilities", "••• その他")]):
+                                           ("stampbook", "▣ スタンプ帳"), ("events", "🎪 イベント"), ("facilities", "••• その他")]):
             with col:
                 if st.button(label, key="nav_" + page, type="primary" if page == active else "secondary",
                              width="stretch"):
@@ -2089,7 +2373,7 @@ def main() -> None:
     # 旧URLのpageにも互換対応。
     page = st.query_params.get("view", st.query_params.get("page", "home"))
     routes = {"home": render_home, "map": render_map, "facilities": render_facilities,
-              "visit": render_visit, "stampbook": render_stampbook}
+              "visit": render_visit, "stampbook": render_stampbook, "events": render_events}
     screen = "facility_detail" if page == "facilities" and st.query_params.get("facility_id") else page
     state_snapshot = {"view": page, "facility_id": st.query_params.get("facility_id"),
                       "wards": st.session_state.get("map_selected_wards", []),
