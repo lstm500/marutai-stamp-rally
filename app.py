@@ -1088,6 +1088,8 @@ def render_facility_card(
 
 # ── 3. 地図 ──
 TOKYO_CENTER = (35.6764, 139.7483)
+DEFAULT_MAP_CENTER = (35.624, 139.735)
+DEFAULT_MAP_ZOOM = 12
 TOKYO_23_BOUNDS = [[35.52, 139.55], [35.82, 139.93]]
 
 
@@ -1111,14 +1113,14 @@ def _valid_facilities(facilities: Iterable[dict[str, Any]]) -> list[tuple[dict[s
 def build_facility_map(
     facilities: Iterable[dict[str, Any]],
     visited_ids: set[str],
-    zoom_start: int = 11,
+    zoom_start: int = 12,
     fit_23_wards: bool | None = None,
 ) -> folium.Map:
     facilities = list(facilities)
     valid = _valid_facilities(facilities)
 
     if fit_23_wards is None:
-        fit_23_wards = zoom_start <= 12
+        fit_23_wards = False
 
     if fit_23_wards:
         center = TOKYO_CENTER
@@ -1130,7 +1132,7 @@ def build_facility_map(
             sum(lon for _, _, lon in valid) / len(valid),
         )
     else:
-        center = TOKYO_CENTER
+        center = DEFAULT_MAP_CENTER
 
     m = folium.Map(
         location=center,
@@ -1234,6 +1236,122 @@ WARDS = [
 ]
 
 
+# ── 現在地と半径検索（位置はこのブラウザのセッション内だけで使用） ──
+@st.cache_resource(show_spinner=False)
+def browser_location_component():
+    return st.components.v2.component(
+        "marutai_browser_location",
+        html='<button type="button" id="locate">📍 現在地を取得して検索</button><p id="message" role="status" aria-live="polite"></p>',
+        css="""
+        button { width:100%; min-height:46px; border:1px solid #d4dce4; border-radius:12px;
+                 color:#173a5e; background:#fff; font:700 16px sans-serif; cursor:pointer; }
+        button:active { background:#dceef5; }
+        button:disabled { background:#eef4f8; cursor:wait; }
+        p { color:#173a5e; font:14px sans-serif; margin:6px 0; }
+        """,
+        js="""
+        export default function({ parentElement, setStateValue }) {
+          const button = parentElement.querySelector('#locate');
+          const message = parentElement.querySelector('#message');
+          let mounted = true;
+          button.onclick = () => {
+            if (!navigator.geolocation) {
+              setStateValue('result', {status:'error', code:0, stamp:Date.now()});
+              return;
+            }
+            button.disabled = true;
+            message.textContent = '現在地を取得しています。位置情報の使用を許可してください。';
+            navigator.geolocation.getCurrentPosition(
+              position => {
+                if (!mounted) return;
+                button.disabled = false;
+                message.textContent = '';
+                setStateValue('result', {status:'ok', lat:position.coords.latitude,
+                  lon:position.coords.longitude, accuracy:position.coords.accuracy, stamp:Date.now()});
+              },
+              error => {
+                if (!mounted) return;
+                button.disabled = false;
+                message.textContent = '';
+                setStateValue('result', {status:'error', code:error.code, stamp:Date.now()});
+              },
+              {enableHighAccuracy:true, timeout:15000, maximumAge:0}
+            );
+          };
+          return () => { mounted = false; button.onclick = null; };
+        }
+        """,
+    )
+
+
+def valid_current_location(value):
+    if not isinstance(value, dict) or value.get("status") != "ok":
+        return None
+    try:
+        lat, lon = float(value["lat"]), float(value["lon"])
+        accuracy = max(0.0, float(value.get("accuracy", 0)))
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(accuracy)
+                and -90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return dict(lat=lat, lon=lon, accuracy=accuracy)
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    """WGS84座標間の大円距離。徒歩経路距離ではない。"""
+    lat1, lon1, lat2, lon2 = map(math.radians, map(float, (lat1, lon1, lat2, lon2)))
+    a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2
+    return 6371.0088 * 2 * math.asin(math.sqrt(max(0.0, min(1.0, a))))
+
+
+def facility_distance(facility, origin):
+    try:
+        lat, lon = float(facility["latitude"]), float(facility["longitude"])
+        if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return distance_km(origin["lat"], origin["lon"], lat, lon)
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def render_location_filter():
+    use_radius = st.checkbox("現在地から選ぶ", key="use_current_radius")
+    if not use_radius:
+        return None, None, False
+    st.caption("現在地から直線距離で半径内の施設を探します。区などの条件と組み合わせられます。")
+    radius = st.number_input("半径（km）", min_value=0.1, value=3.0, step=0.5, key="current_radius_km")
+    epoch = st.session_state.get("location_epoch", 0)
+    result = browser_location_component()(
+        key=f"current_location_{epoch}", default={"result": None}, on_result_change=lambda: None)
+    data = result.result
+    if data and data.get("stamp") != st.session_state.get("last_location_stamp"):
+        st.session_state["last_location_stamp"] = data.get("stamp")
+        current = valid_current_location(data)
+        if current:
+            st.session_state["search_origin"] = current
+            st.session_state.pop("location_error", None)
+        else:
+            st.session_state.pop("search_origin", None)
+            messages = {1: "位置情報が許可されていません。ブラウザの位置情報を許可して、もう一度取得してください。",
+                        2: "現在地を取得できませんでした。端末の位置情報をオンにして、もう一度取得してください。",
+                        3: "現在地の取得が時間切れになりました。もう一度取得してください。"}
+            st.session_state["location_error"] = messages.get(data.get("code"), "この環境では現在地を取得できません。")
+    if st.session_state.get("location_error"):
+        st.warning(st.session_state["location_error"])
+    origin = st.session_state.get("search_origin")
+    if origin:
+        st.caption(f"現在地を取得済み ｜ 位置精度の目安：約{origin['accuracy']:.0f}m（取得した位置を固定して使用）")
+        if st.button("取得した現在地をクリア", key="clear_current_location"):
+            for name in ("search_origin", "last_location_stamp", "location_error"):
+                st.session_state.pop(name, None)
+            st.session_state["location_epoch"] = epoch + 1
+            st.rerun()
+    else:
+        st.info("「現在地を取得して検索」を押してください。取得するまで半径検索の結果は表示しません。")
+    return origin, float(radius), True
+
+
 def render_map(go):
     st.markdown("# 🗺️ 地図から探す")
     render_data_settings()
@@ -1242,7 +1360,7 @@ def render_map(go):
 
     if not facilities:
         st.warning("施設一覧をまだ取得できていません。上の「施設一覧を検索して更新」から再実行できます。")
-        st_folium(build_facility_map([], visited), width=None, height=430, returned_objects=[])
+        st_folium(build_facility_map([], visited, zoom_start=DEFAULT_MAP_ZOOM, fit_23_wards=False), width=None, height=430, returned_objects=[])
         return
 
     default_open_air = st.query_params.get("open_air") == "1"
@@ -1255,7 +1373,9 @@ def render_map(go):
         )
         open_air = st.checkbox("露天風呂あり", value=default_open_air)
         natural = st.checkbox("天然温泉あり")
-        ward = st.selectbox("区を選ぶ", ["すべて"] + WARDS)
+        wards = st.multiselect("区を選ぶ", WARDS, placeholder="すべての区（複数選択可）", key="map_selected_wards")
+        st.caption("未選択の場合は、すべての区を検索します。")
+        origin, radius_km, use_radius = render_location_filter()
         visit_state = st.selectbox("訪問状態", ["すべて", "未訪問", "訪問済み"], index=0)
 
     filtered = []
@@ -1267,18 +1387,39 @@ def render_map(go):
             continue
         if natural and not f.get("has_natural_hot_spring"):
             continue
-        if ward != "すべて" and f.get("ward") != ward:
+        if wards and f.get("ward") not in wards:
             continue
         if visit_state == "訪問済み" and fid not in visited:
             continue
         if visit_state == "未訪問" and fid in visited:
             continue
+        if use_radius:
+            if origin is None:
+                continue
+            distance = facility_distance(f, origin)
+            if distance is None or distance > radius_km:
+                continue
         filtered.append(f)
 
+    if use_radius and origin:
+        filtered.sort(key=lambda f: facility_distance(f, origin))
     located = sum(f.get("latitude") is not None and f.get("longitude") is not None for f in filtered)
     st.caption(f"検索結果：{len(filtered)}施設 ｜ 地図：{located}施設 ｜ 位置未確認：{len(filtered)-located}施設")
+    facility_map = build_facility_map(filtered, visited, zoom_start=DEFAULT_MAP_ZOOM, fit_23_wards=False)
+    # 検索結果の偏りでは初期縮尺・初期中心を変えない。
+    facility_map.location = list(DEFAULT_MAP_CENTER)
+    if use_radius and origin:
+        # 既定の23区fit_boundsより後に設定し、現在地と検索円を画面に収める。
+        circle = folium.Circle([origin["lat"], origin["lon"]], radius=radius_km*1000,
+                              color="#1976d2", weight=3, fill=True, fill_opacity=0.06,
+                              tooltip=f"現在地から半径{radius_km:g}km").add_to(facility_map)
+        folium.CircleMarker([origin["lat"], origin["lon"]], radius=9, color="white", weight=3,
+                            fill=True, fill_color="#1a73e8", fill_opacity=1,
+                            tooltip="取得した現在地").add_to(facility_map)
+        facility_map.fit_bounds(circle.get_bounds(), padding=(20, 20), max_zoom=16)
+        st.caption(f"現在地から半径{radius_km:g}km以内 ｜ 近い順 ｜ 位置未確認の施設は半径検索の対象外です。")
     st_folium(
-        build_facility_map(filtered, visited, zoom_start=11, fit_23_wards=True),
+        facility_map,
         width=None,
         height=455,
         returned_objects=[],
@@ -1286,6 +1427,8 @@ def render_map(go):
 
     st.markdown("### 施設一覧")
     for f in filtered:
+        if use_radius and origin:
+            st.caption(f"現在地から直線 {facility_distance(f, origin):.2f}km")
         render_facility_card(
             f,
             str(f.get("id")) in visited,
