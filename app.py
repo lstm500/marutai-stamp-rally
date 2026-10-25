@@ -27,7 +27,7 @@ ASSET_DIR = ROOT / "assets"
 STAMP_PATH = ASSET_DIR / "tai_stamp.png"
 BUCKET = "visit-photos"
 LOGGER = logging.getLogger("marutai")
-APP_VERSION = "2026-10-25-visit-log-fix"
+APP_VERSION = "2026-10-25-shadowroot-log-fix"
 
 # 公開一覧の取得済みデータ。出典・取得日・設備不明の扱いは検索設定欄に表示。
 # 2026-10-25に検索取得し、既存facilities形式へ変換した初期データ。
@@ -772,17 +772,32 @@ def flush_activity_logs():
 
 @st.cache_resource(show_spinner=False)
 def paint_report_component():
-    return st.components.v2.component("marutai_display_report", html='<span style="display:none"></span>',
+    return st.components.v2.component("marutai_display_report",
+        html='<span data-report-state style="display:none"></span>',
         js="""
         export default function({parentElement,data,setStateValue}) {
-          if (!data || parentElement.dataset.reported === data.id) return;
-          parentElement.dataset.reported = data.id;
-          let alive = true;
-          requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (alive) setStateValue('paint', {id:data.id, screen:data.screen,
-                elapsed_ms: data.click_ms ? Math.max(0,Date.now()-data.click_ms) : null});
-          }));
-          return () => { alive=false; };
+          if (!data || !data.id) return;
+          // parentElementは通常ShadowRoot。datasetは内部のHTMLElementだけに使う。
+          const marker = parentElement?.querySelector?.('[data-report-state]');
+          const sendError = error => setStateValue('paint', {id:data.id, screen:data.screen,
+            status:'error', error_type:error?.name || 'DisplayReporterError',
+            error_message:String(error?.message || error).slice(0,500)});
+          if (!marker) { sendError(new Error('Display reporter element is missing')); return; }
+          if (marker.dataset.reported === data.id) return;
+          let alive=true, first=0, second=0;
+          try {
+            first=requestAnimationFrame(() => {
+              second=requestAnimationFrame(() => {
+                if (!alive) return;
+                try {
+                  setStateValue('paint', {id:data.id, screen:data.screen, status:'ok',
+                    elapsed_ms: Number.isFinite(data.click_ms) ? Math.max(0,Date.now()-data.click_ms) : null});
+                  marker.dataset.reported=data.id;
+                } catch (error) { sendError(error); }
+              });
+            });
+          } catch (error) { sendError(error); }
+          return () => { alive=false; cancelAnimationFrame(first); cancelAnimationFrame(second); };
         }
         """)
 
@@ -796,6 +811,12 @@ def report_display_timing(screen):
         on_paint_change=lambda: None)
     report = result.paint
     if isinstance(report, dict) and report.get("id") == trace["id"]:
+        if report.get("status") == "error":
+            audit("browser_reporter_error", status="error", action=trace["action"], event_id=trace["id"],
+                  to_view=report.get("screen"), stage="display_reporter", error_type=report.get("error_type"),
+                  error_message=str(report.get("error_message", ""))[:500])
+            st.session_state["last_painted_action"] = trace["id"]
+            return
         elapsed = report.get("elapsed_ms")
         if isinstance(elapsed, (int, float)) and 0 <= elapsed <= 3600000:
             audit("browser_first_paint", elapsed_ms=elapsed, action=trace["action"],
@@ -805,17 +826,56 @@ def report_display_timing(screen):
         st.session_state["last_painted_action"] = trace["id"]
 
 
+def parse_activity_jsonl(text):
+    rows = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = _json.loads(line)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"ログの{number}行目を読み取れません。") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"ログの{number}行目がオブジェクトではありません。")
+        rows.append(row)
+    return rows
+
+
+def export_activity_json(rows, scope):
+    unique, seen = [], set()
+    for row in rows:
+        # 保存ファイルの結合時も、同じセッション・連番を重複させない。
+        key = (row.get("session_id"), row.get("sequence"))
+        if None not in key:
+            if key in seen:
+                continue
+            seen.add(key)
+        unique.append(row)
+    unique.sort(key=lambda r: (str(r.get("at", "")), str(r.get("session_id", "")), int(r.get("sequence", 0))))
+    payload = {"schema_version": 1, "app_version": APP_VERSION,
+               "exported_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(),
+               "scope": scope, "event_count": len(unique),
+               "time_range": {"from": unique[0].get("at") if unique else None,
+                              "to": unique[-1].get("at") if unique else None},
+               "summary": {"error_count": sum(r.get("status") == "error" for r in unique),
+                           "browser_display_report_count": sum(r.get("event") in ("browser_first_paint", "browser_display_confirmed") for r in unique)},
+               "events": unique}
+    return _json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+
+
 def render_activity_logs():
     with st.expander("動作ログ・エラーの確認"):
-        st.caption("操作、サーバー処理時間、表示画面、ブラウザの初回描画時間、エラー種別を記録します。写真や感想本文は含めません。")
+        st.caption("操作、サーバー処理時間、表示画面、ブラウザの初回描画時間、エラーを記録します。ダウンロードは通常のJSON形式です。保存先内部のJSONL形式も引き続き読み取れます。写真や感想本文は含めません。")
         rows = st.session_state.get("audit_overflow", []) + st.session_state.get("activity_log", [])
         if st.session_state.get("audit_storage_error"):
             st.warning("ログのクラウド保存に失敗しています。このセッションのログは下からダウンロードできます。")
-        st.download_button("このセッションのログをダウンロード", "\n".join(_json.dumps(r, ensure_ascii=False) for r in rows),
-                           file_name="marutai_activity.jsonl", mime="application/x-ndjson", key="download_activity")
+        st.download_button("このセッションのログをダウンロード", export_activity_json(rows, "current_session"),
+                           file_name="marutai_activity.json", mime="application/json", key="download_activity")
         day = st.date_input("保存済みログの日付", value=datetime.now(ZoneInfo("Asia/Tokyo")).date(), key="log_day")
         if st.button("この日の保存済みログを取得", key="fetch_activity"):
             try:
+                audit("log_export_requested", action="saved_day_log")
+                flush_activity_logs()
                 bucket = db().storage.from_(BUCKET)
                 prefix = "activity-logs/" + day.isoformat()
                 parts, offset = [], 0
@@ -827,7 +887,7 @@ def render_activity_logs():
                         if str(f.get("name", "")).endswith(".jsonl"):
                             parts.append(bucket.download(prefix + "/" + f["name"]).decode("utf-8"))
                     offset += len(files)
-                st.session_state["download_saved_activity"] = "\n".join(parts)
+                st.session_state["download_saved_activity"] = export_activity_json(parse_activity_jsonl("\n".join(parts)), "saved_day:" + day.isoformat())
                 st.session_state["download_saved_activity_day"] = day.isoformat()
                 st.info(f"{len(parts)}ファイルのログを取得しました。")
             except Exception as exc:
@@ -835,8 +895,8 @@ def render_activity_logs():
                 st.error("保存済みログを取得できませんでした。")
         if st.session_state.get("download_saved_activity"):
             st.download_button("取得したログをダウンロード", st.session_state["download_saved_activity"],
-                               file_name="marutai_activity_" + st.session_state["download_saved_activity_day"] + ".jsonl",
-                               mime="application/x-ndjson", key="download_saved_activity_button")
+                               file_name="marutai_activity_" + st.session_state["download_saved_activity_day"] + ".json",
+                               mime="application/json", key="download_saved_activity_button")
 
 
 # ── 「行ってきた！」は写真不要の訪問済み記録。内容は後から追記できる ──
