@@ -371,6 +371,34 @@ hr { border-color:var(--marutai-border) !important; }
   -webkit-text-fill-color:var(--marutai-navy) !important;
   background:transparent !important;
 }
+/* Login input: white field, navy password dots and readable selection on Android. */
+[data-testid="stTextInput"] [data-baseweb="input"],
+[data-testid="stTextInput"] [data-baseweb="base-input"],
+[data-testid="stTextInput"] [data-baseweb="input"] > div {
+  background-color:#ffffff !important;
+  color-scheme:light !important;
+}
+[data-testid="stTextInput"] input[type="password"] {
+  color:#173a5e !important;
+  -webkit-text-fill-color:#173a5e !important;
+  caret-color:#173a5e !important;
+  color-scheme:light !important;
+  background-color:#ffffff !important;
+}
+[data-testid="stTextInput"] input[type="password"]::selection {
+  background-color:#f4bbb3 !important;
+  color:#173a5e !important;
+  -webkit-text-fill-color:#173a5e !important;
+}
+[data-testid="stTextInput"] input[type="password"]::-moz-selection {
+  background-color:#f4bbb3 !important;
+  color:#173a5e !important;
+}
+[data-testid="stTextInput"] input[type="password"]:-webkit-autofill {
+  -webkit-box-shadow:0 0 0 1000px #ffffff inset !important;
+  -webkit-text-fill-color:#173a5e !important;
+  caret-color:#173a5e !important;
+}
 input::placeholder, textarea::placeholder {
   color:#8a929b !important;
   -webkit-text-fill-color:#8a929b !important;
@@ -1684,10 +1712,14 @@ def build_facility_map(
         visited = fid in visited_ids
 
         if visited:
+            # "た" を円の中央に1文字だけ表示。枠線を含め42pxに収め、折り返しを禁止。
             marker_html = """
-            <div style='width:42px;height:42px;border-radius:50%;background:#d9362b;color:white;
-            border:4px solid #ffd54f;box-shadow:0 2px 8px #0005;display:flex;align-items:center;
-            justify-content:center;font-weight:900;font-size:15px;font-family:sans-serif;'>たい</div>
+            <div style='box-sizing:border-box;width:42px;height:42px;border-radius:50%;
+            background:#d9362b;color:#ffffff;border:3px solid #ffd54f;
+            box-shadow:0 2px 8px #0005;display:flex;align-items:center;
+            justify-content:center;white-space:nowrap;overflow:hidden;
+            line-height:1;text-align:center;font-weight:900;font-size:20px;
+            font-family:sans-serif;'>た</div>
             """
         else:
             marker_html = """
@@ -1699,8 +1731,8 @@ def build_facility_map(
             """
 
         events = facility_events(fid)
-        if events:
-            marker_html = marker_html.replace("background:#173a5e", "background:#7b2cbf").replace("background:#d9362b", "background:#7b2cbf")
+        if events and not visited:
+            marker_html = marker_html.replace("background:#173a5e", "background:#7b2cbf")
         marker_html = marker_html.replace("<div ", '<div data-marutai-marker="' + escape(fid, quote=True) + '" ', 1)
         name = escape(str(facility.get("name", "")))
         ward = escape(str(facility.get("ward", "")))
@@ -1728,7 +1760,7 @@ def build_facility_map(
             location=[lat, lon],
             popup=folium.Popup(popup_html, max_width=300, max_height=340),
             tooltip=name,
-            icon=folium.DivIcon(html=marker_html, icon_size=(42, 42), icon_anchor=(21, 36)),
+            icon=folium.DivIcon(html=marker_html, icon_size=(42, 42), icon_anchor=(21, 21) if visited else (21, 36)),
         ).add_to(m)
 
     return m
